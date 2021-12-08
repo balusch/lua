@@ -231,6 +231,7 @@ static int equalkey (const TValue *k1, const Node *n2, int deadok) {
       return pvalue(k1) == pvalueraw(keyval(n2));
     case LUA_VLCF:
       return fvalue(k1) == fvalueraw(keyval(n2));
+      /* QUESTION: 为啥这里要使用 ctb？long string 难道不是默认就是 collectable 的么？ */
     case ctb(LUA_VLNGSTR):
       return luaS_eqlngstr(tsvalue(k1), keystrval(n2));
     default:
@@ -244,6 +245,7 @@ static int equalkey (const TValue *k1, const Node *n2, int deadok) {
 ** part of table 't'. (Otherwise, the array part must be larger than
 ** 'alimit'.)
 */
+/* QUESTION: 难道不是 ispow2(t->alimit) 就一定有 isrealasize() ？ */
 #define limitequalsasize(t)	(isrealasize(t) || ispow2((t)->alimit))
 
 
@@ -251,9 +253,24 @@ static int equalkey (const TValue *k1, const Node *n2, int deadok) {
 ** Returns the real size of the 'array' array
 */
 LUAI_FUNC unsigned int luaH_realasize (const Table *t) {
+
+  /* NOTE: 结合这个函数以及 isrealasize() 宏的注释，我感觉 alimit 的含义可能是这样的：
+      - 首先 alimit 是作为计算 table array 长度的一个 hint，所以它肯定不能比 array 的容量(capacity)大
+        (从 limitequalsasize() 函数的注释中也可以看出来) 也就是说 alimit 肯定在 [0, capacity] 之间，
+      - 但是这个函数根据 alimit 就可以推算出 array 的 capacity:
+          - 如果 alimit 是 2 的幂，那么它就是 capacity
+          - 否则，capacity 就是最小的 >= alimit 的 2 的幂
+        由此说明，alimit 应该在 (capacity/2, capacity] 之间
+      - 以上情况，只有在 capacity 为 2 的幂时才有效，还得理解 ispow2realasize() 的含义
+     TODO: 还需要看下 alimit 的变化情况() */
+
   if (limitequalsasize(t))
     return t->alimit;  /* this is the size */
   else {
+    /* NOTE: 计算最小的 >= t->alimit 的 2 的幂，这里 t->alimit 不能为 2 的幂(在上面的 if 中就被处理了)
+         对于 t->alimit=32，下面逻辑计算出来的值为 64，而不是 32，算法逻辑可以参考以下链接：
+         - https://stackoverflow.com/questions/466204/rounding-up-to-next-power-of-2
+         - https://jameshfisher.com/2018/03/30/round-up-power-2 */
     unsigned int size = t->alimit;
     /* compute the smallest power of 2 not smaller than 'n' */
     size |= (size >> 1);
@@ -277,6 +294,11 @@ LUAI_FUNC unsigned int luaH_realasize (const Table *t) {
 ** without changing the real size.)
 */
 static int ispow2realasize (const Table *t) {
+  /* NOTE(1): !isrealaisze(t) 说明 alimit 不是 real size，此时 real size 通过
+      luaH_realasize() 计算出来，得到的结果是 next-power-2(alimit)，自然也是 pow2?
+     NOTE(2): 为什么说只有 real size 为 pow2 时，才可以在没有修改 real size 的情况下
+      修改 alimit 呢？
+     QUESTION(3): 什么情况下 real size 不是 pow2 呢？*/
   return (!isrealasize(t) || ispow2(t->alimit));
 }
 
@@ -444,10 +466,11 @@ static unsigned int numusearray (const Table *t, unsigned int *nums) {
     }
     /* count elements in range (2^(lg - 1), 2^lg] */
     for (; i <= lim; i++) {
+      /* NOTE: 这里用的是 i-1，是因为 Lua table 索引从 1 开始，t[0] = 1234 会被放在 hash part */
       if (!isempty(&t->array[i-1]))
         lc++;
     }
-    nums[lg] += lc;
+    nums[lg] += lc; /* QUESTION: 为啥不是直接 =，而要 += ? */
     ause += lc;
   }
   return ause;
@@ -480,13 +503,14 @@ static int numusehash (const Table *t, unsigned int *nums, unsigned int *pna) {
 */
 static void setnodevector (lua_State *L, Table *t, unsigned int size) {
   if (size == 0) {  /* no elements to hash part? */
+    /* QUESTION: dummynode 的作用是什么？直接用 NULL 不行么？ */
     t->node = cast(Node *, dummynode);  /* use common 'dummynode' */
     t->lsizenode = 0;
     t->lastfree = NULL;  /* signal that it is using dummy node */
   }
   else {
     int i;
-    int lsize = luaO_ceillog2(size);
+    int lsize = luaO_ceillog2(size); /* computes ceil(log2(size)) */
     if (lsize > MAXHBITS || (1u << lsize) > MAXHSIZE)
       luaG_runerror(L, "table overflow");
     size = twoto(lsize);
@@ -559,18 +583,29 @@ void luaH_resize (lua_State *L, Table *t, unsigned int newasize,
   TValue *newarray;
   /* create new hash part with appropriate size into 'newt' */
   setnodevector(L, &newt, nhsize);
+  /* NOTE: 如果 array 部分是收缩的话，需要将被收缩的 array 部分移动到新 table 的 hash 中去 */
   if (newasize < oldasize) {  /* will array shrink? */
+    /* QUESTION: 这个 t->alimit 具体影响了哪里的逻辑? */
     t->alimit = newasize;  /* pretend array has new size... */
     exchangehashpart(t, &newt);  /* and new hash */
     /* re-insert into the new hash the elements from vanishing slice */
     for (i = newasize; i < oldasize; i++) {
       if (!isempty(&t->array[i]))
+        /* QUESTION: 会不会存在 key 相同的情况? */
         luaH_setint(L, t, i + 1, &t->array[i]);
     }
+    /* NOTE: 此时 newt 中包含 old array 中将被删除的部分，暂时还没有将 old hash 中的元素移过来 */
     t->alimit = oldasize;  /* restore current size... */
     exchangehashpart(t, &newt);  /* and hash (in case of errors) */
   }
   /* allocate new array */
+  /*
+   * NOTE: 注意内存分配顺序，由于需要分配 hash 和 array 两块内存，第一次分配的失败了
+   *       可以直接返回，但是如果第一步成功但是第二步失败就需要清理第一步分配的内存，所
+   *       以这里先分配 hash 部分，在 setnodevector 中如果分配失败就直接 longjmp
+   *       返回了；第二步才分配 array 部分，如果分配失败，不会立刻 longjmp 返回，而是
+   *       先清理 new hash
+   */
   newarray = luaM_reallocvector(L, t->array, oldasize, newasize, TValue);
   if (l_unlikely(newarray == NULL && newasize > 0)) {  /* allocation failed? */
     freehash(L, &newt);  /* release new hash part */
@@ -607,6 +642,7 @@ static void rehash (lua_State *L, Table *t, const TValue *ek) {
   na = numusearray(t, nums);  /* count keys in array part */
   totaluse = na;  /* all those keys are integer keys */
   totaluse += numusehash(t, nums, &na);  /* count keys in hash part */
+  /* TODO: 下面的 extra key 逻辑没有看懂 */
   /* count extra key */
   if (ttisinteger(ek))
     na += countint(ivalue(ek), nums);
@@ -645,6 +681,7 @@ void luaH_free (lua_State *L, Table *t) {
 
 static Node *getfreepos (Table *t) {
   if (!isdummy(t)) {
+    /* NOTE: 如果存在 free slot，那么只能在 t->lastfree 前面 */
     while (t->lastfree > t->node) {
       t->lastfree--;
       if (keyisnil(t->lastfree))
@@ -675,6 +712,7 @@ void luaH_newkey (lua_State *L, Table *t, const TValue *key, TValue *value) {
       setivalue(&aux, k);
       key = &aux;  /* insert it as an integer */
     }
+    /* NOTE: 如何判断是否为 NaN: NaN != NaN */
     else if (l_unlikely(luai_numisnan(f)))
       luaG_runerror(L, "table index is NaN");
   }
@@ -687,24 +725,38 @@ void luaH_newkey (lua_State *L, Table *t, const TValue *key, TValue *value) {
     if (f == NULL) {  /* cannot find a free place? */
       rehash(L, t, key);  /* grow table */
       /* whatever called 'newkey' takes care of TM cache */
+      /* QUESTION: 为什么这里不需要重新解决哈希冲突? */
       luaH_set(L, t, key, value);  /* insert key into grown table */
       return;
     }
-    lua_assert(!isdummy(t));
+    lua_assert(!isdummy(t)); /* NOTE: 存在 freepos，肯定不是 dummy */
     othern = mainposition(t, keytt(mp), keyval(mp));
     if (othern != mp) {  /* is colliding node out of its main position? */
+      /* NOTE: f 的插入位置(指针实际是 distance)
+               插入前: prev1 -> mp(old) -> next1 -> next2
+               插入后: prev1 -> f(old) -> next1 -> next2(感觉有问题，mp 都给丢了)
+               f 在位置上不同于之前的 mp，但是内容是将 mp 的复制过去了 */
       /* yes; move colliding node into free position */
+      /* QUESTION: 怎么保证 othern 一定在 mp 的前面呢? */
       while (othern + gnext(othern) != mp)  /* find previous */
         othern += gnext(othern);
       gnext(othern) = cast_int(f - othern);  /* rechain to point to 'f' */
       *f = *mp;  /* copy colliding node into free pos. (mp->next also goes) */
       if (gnext(mp) != 0) {
+        /* NOTE: 这里为什么用 +=，因为前面 *f = *mp 把 mp 到 mp->next1 的距离给复制过来了，
+            如果 mp 到 mp->next1 的距离(即 gnext(mp)) 不为 0，说明 mp 后面的确有元素，所以
+            f 到 mp->next1 的距离实际上是 f 到 mp 的距离加上 mp 到 mp->next 的距离*/
         gnext(f) += cast_int(mp - f);  /* correct 'next' */
+        /* QUESTION: 为啥下面的 mp 就不用 set 为 0 呢？ */
         gnext(mp) = 0;  /* now 'mp' is free */
       }
+      /* QUESTION: 为什么下面的 else 不用 setempty? */
       setempty(gval(mp));
     }
     else {  /* colliding node is in its own main position */
+      /* NOTE: f 的插入位置(指针实际是节点间的 distance)
+               插入前: prev1 -> mp(old) -> next1 -> next2
+               插入后: prev1 -> mp(old) -> f(new) -> next1 -> next2 */
       /* new node will go into free position */
       if (gnext(mp) != 0)
         gnext(f) = cast_int((mp + gnext(mp)) - f);  /* chain new position */
@@ -734,6 +786,18 @@ const TValue *luaH_getint (Table *t, lua_Integer key) {
   else if (!limitequalsasize(t) &&  /* key still may be in the array part? */
            (l_castS2U(key) == t->alimit + 1 ||
             l_castS2U(key) - 1u < luaH_realasize(t))) {
+
+    /* NOTE: 这里的 key 是 Lua index，从 1 开始，所以需要减一再和 t->alimit 比较，
+        alimit 可能等于 capacity(limitequalsasize())，也可能小于 capacity(!equal)
+        不论是 equal 还是 not equal，如果 key-1(C index) < alimit，说明就是在 array 中
+        否则，!limitequalasize() 时，capacity 等于 next-power-of-2(alimit)，且肯定大于
+        alimit；所以 key == alimit+1 或者 key-1 < realasize 的 key 都在 array 部分，
+        为什么单独吧 alimit+1 拎出来比较，而不比较 alimit+2/3/... 呢？我觉得主要有 2 个原因：
+        1. alimit+1 是唯一确定 <= realasize 的，而 alimit+2/3/... 则不一定
+        2. 基于上一条原因，如果恰好 key == alimit+1，那么就可以省去一次 lauH_realasize() */
+
+    /* QUESTION: 什么时候才会 !limitequalsasize(t) 呢？ */
+
     t->alimit = cast_uint(key);  /* probably '#t' is here now */
     return &t->array[key - 1];
   }
@@ -878,6 +942,7 @@ static lua_Unsigned hash_search (Table *t, lua_Unsigned j) {
 }
 
 
+/* QUESTION: 经常很疑惑，怎么快速看出这样的函数是否可以正常终止呢? */
 static unsigned int binsearch (const TValue *array, unsigned int i,
                                                     unsigned int j) {
   while (j - i > 1u) {  /* binary search */
@@ -921,13 +986,33 @@ static unsigned int binsearch (const TValue *array, unsigned int i,
 ** (In those cases, the boundary is not inside the array part, and
 ** therefore cannot be used as a new limit.)
 */
+
+/*
+ * NOTE: luaH_getn 用来计算 table 的长度，比如 C API 中的 lua_rawlen(t)，或者 Lua 中的 #t，
+ *  就是通过这个函数来计算的；luaH_getn(t) 就是用来找出 t 中的一个 integer index boundary，使得：
+ *      1. t[i] 存在于 t，而 t[i+1] 不存在
+ *      2. 否则，当 t[1] 不存在，那么该 boundary 就是 0
+ *      3. 否则，boundary 就是...
+ */
 lua_Unsigned luaH_getn (Table *t) {
   unsigned int limit = t->alimit;
   if (limit > 0 && isempty(&t->array[limit - 1])) {  /* (1)? */
     /* there must be a boundary before 'limit' */
     if (limit >= 2 && !isempty(&t->array[limit - 2])) {
+      /* NOTE: 走到这里：
+          - 最后一个 slot(limit - 1) 为空
+          - 倒数第二个 slot(limit -2) 不为空，说明 limit-1 就是 #t */
       /* 'limit - 1' is a boundary; can it be a new limit? */
       if (ispow2realasize(t) && !ispow2(limit - 1)) {
+        /* NOTE(1): 以下代码就会进入这种情况：
+         *     local t = { 1, 2, 3 }
+         *     t[2] = nil
+         *     print(#t) -- 3
+         *  此时 alimit = 4, array[0] = 1, array[1] = nil, array[2] = 3
+         *
+         * NOTE(2): 只有 realasize 为 pow2，才可以修改 alimit；
+         * QUESTION: 为什么还要 !ispow2(alimit-1) 呢？
+         */
         t->alimit = limit - 1;
         setnorealasize(t);  /* now 'alimit' is not the real size */
       }
@@ -936,9 +1021,10 @@ lua_Unsigned luaH_getn (Table *t) {
     else {  /* must search for a boundary in [0, limit] */
       unsigned int boundary = binsearch(t->array, 0, limit);
       /* can this boundary represent the real size of the array? */
+      /* QUESTION: 为什么上面(1)的判断条件和这里的不一样? */
       if (ispow2realasize(t) && boundary > luaH_realasize(t) / 2) {
         t->alimit = boundary;  /* use it as the new limit */
-        setnorealasize(t);
+        setnorealasize(t); /* QUESTION: 怎么知道 boundary 一定不是 realsize?*/
       }
       return boundary;
     }
@@ -949,12 +1035,13 @@ lua_Unsigned luaH_getn (Table *t) {
     if (isempty(&t->array[limit]))  /* 'limit + 1' is empty? */
       return limit;  /* this is the boundary */
     /* else, try last element in the array */
+    /* QUESTION: luaH_realasize 是 power of 2，所以 t->array 的大小一直都是二的幂么？*/
     limit = luaH_realasize(t);
     if (isempty(&t->array[limit - 1])) {  /* empty? */
       /* there must be a boundary in the array after old limit,
          and it must be a valid new limit */
       unsigned int boundary = binsearch(t->array, t->alimit, limit);
-      t->alimit = boundary;
+      t->alimit = boundary; /* QUESTION: 为什么说 it must be a valid new limit? */
       return boundary;
     }
     /* else, new limit is present in the table; check the hash part */
