@@ -43,6 +43,7 @@
 ** MAXABITS is the largest integer such that MAXASIZE fits in an
 ** unsigned int.
 */
+/* NOTE: MAXABITS == 31(on my iMac) */
 #define MAXABITS	cast_int(sizeof(int) * CHAR_BIT - 1)
 
 
@@ -88,6 +89,7 @@
 #define hashpointer(t,p)	hashmod(t, point2uint(p))
 
 
+/* REF: https://blog.codingnow.com/2012/01/lua_link_bug.html */
 #define dummynode		(&dummynode_)
 
 static const Node dummynode_ = {
@@ -241,6 +243,9 @@ static int equalkey (const TValue *k1, const Node *n2, int deadok) {
 ** part of table 't'. (Otherwise, the array part must be larger than
 ** 'alimit'.)
 */
+
+/* QUESTION: 存在 isrealasize(t) && !ispow2(alimit)
+    或者 !isrealasize(t) && ispow2(alimit) 的情况么？ */
 #define limitequalsasize(t)	(isrealasize(t) || ispow2((t)->alimit))
 
 
@@ -248,9 +253,26 @@ static int equalkey (const TValue *k1, const Node *n2, int deadok) {
 ** Returns the real size of the 'array' array
 */
 LUAI_FUNC unsigned int luaH_realasize (const Table *t) {
+
+  /* NOTE: 结合这个函数以及 isrealasize() 宏的注释，我感觉 alimit 的含义可能是这样的：
+      - 首先 alimit 是作为计算数组长度的一个 hint，所以它肯定不能比数组的容量(capacity)大
+        (从 limitequalsasize() 宏的注释中也可以看出来) 也就是说 alimit 肯定在 [0, capacity] 之间，
+      - 但是这个函数根据 alimit 就可以推算出 array 的 capacity:
+        - 如果 alimit 是 2 的幂，那么它就是 capacity
+        - 否则，capacity 就是最小的 >= alimit 的 2 的幂
+      由此说明，alimit 应该在 (capacity/2, capacity] 之间
+      - 以上情况，只有在 capacity 为 2 的幂时才有效，还得理解 ispow2realasize() 的含义 */
+
+  /* TODO: 还需要看下 alimit 的变化情况()，理解为什么需要这个看起来如此奇怪的逻辑 */
+
   if (limitequalsasize(t))
     return t->alimit;  /* this is the size */
   else {
+    /* NOTE: 计算最小的 >= t->alimit 的 2 的幂，这里 t->alimit 不能为 2 的幂(如果是，那
+        么在上面的 if 中就被处理了)，对于 t->alimit=32，下面逻辑计算出来的值为 64，而不是
+        32，算法逻辑可以参考以下链接：
+        - https://stackoverflow.com/questions/466204/rounding-up-to-next-power-of-2
+        - https://jameshfisher.com/2018/03/30/round-up-power-2 */
     unsigned int size = t->alimit;
     /* compute the smallest power of 2 not smaller than 'n' */
     size |= (size >> 1);
@@ -273,6 +295,10 @@ LUAI_FUNC unsigned int luaH_realasize (const Table *t) {
 ** (If it is not, 'alimit' cannot be changed to any other value
 ** without changing the real size.)
 */
+
+/* QUESTION: 为啥 !isrealasize() 的时候也说明 realasize 是 pow2 呢？
+    啥时候会有 !isrealasize() && !ispow2(t->alimit) 呢？
+    啥时候会有 isrealasize() && !ispow2(t->alimit) 呢？*/
 static int ispow2realasize (const Table *t) {
   return (!isrealasize(t) || ispow2(t->alimit));
 }
@@ -331,14 +357,19 @@ static unsigned int findindex (lua_State *L, Table *t, TValue *key,
   unsigned int i;
   if (ttisnil(key)) return 0;  /* first iteration */
   i = ttisinteger(key) ? arrayindex(ivalue(key)) : 0;
+  /* NOTE: 这里如果 i 是整数，那么就是一个 lua index，从 1 开始，
+      所以这里需要减一后再和 asize 比较，而对于 array，我们需要返回
+      下一个 key 的 C index，所以 i 正好合适(其实应该是 i-1+1) */
   if (i - 1u < asize)  /* is 'key' inside array part? */
     return i;  /* yes; that's the index */
   else {
     const TValue *n = getgeneric(t, key, 1);
     if (l_unlikely(isabstkey(n)))
       luaG_runerror(L, "invalid key to 'next'");  /* key not found */
+    /* QUESTION: 为啥可以直接 nodefromval()？*/
     i = cast_int(nodefromval(n) - gnode(t, 0));  /* key index in hash table */
     /* hash elements are numbered after array ones */
+    /* NOTE: i+1 是因为我们要返回是下一个 key 的 index */
     return (i + 1) + asize;
   }
 }
@@ -350,10 +381,13 @@ int luaH_next (lua_State *L, Table *t, StkId key) {
   for (; i < asize; i++) {  /* try first array part */
     if (!isempty(&t->array[i])) {  /* a non-empty entry? */
       setivalue(s2v(key), i + 1);
+      /* NOTE: 将 value 放在栈中 key 的上方 */
       setobj2s(L, key + 1, &t->array[i]);
       return 1;
     }
   }
+  /* NOTE: 注意 i -= asize 这句，findindex 如果是在 hash 中找到下一个 entry 的，
+      那么返回的是下一个 entry 的 index 加上 asize */
   for (i -= asize; cast_int(i) < sizenode(t); i++) {  /* hash part */
     if (!isempty(gval(gnode(t, i)))) {  /* a non-empty entry? */
       Node *n = gnode(t, i);
@@ -668,6 +702,8 @@ void luaH_newkey (lua_State *L, Table *t, const TValue *key, TValue *value) {
   else if (ttisfloat(key)) {
     lua_Number f = fltvalue(key);
     lua_Integer k;
+	/* NOTE: 这里对于浮点数类型的 key，会尝试将其转换为整数进行存储，所以
+	    t[3] 和 t[3.0] 其实指向的是同一个元素，而 t[3] 和 t[3.1] 则不是 */
     if (luaV_flttointeger(f, &k, F2Ieq)) {  /* does key fit in an integer? */
       setivalue(&aux, k);
       key = &aux;  /* insert it as an integer */
@@ -677,6 +713,15 @@ void luaH_newkey (lua_State *L, Table *t, const TValue *key, TValue *value) {
   }
   if (ttisnil(value))
     return;  /* do not insert nil values */
+
+  /* NOTE: lua table 也是使用的链地址法处理哈希冲突，但是它并不会动态地创建节点，该表在物理
+      上也是一维的(每个 slot 只有一个节点，而不是一个链表)，冲突的元素都存放在这一维数组中，
+      但是通过 Node 结构中的 u.next 字段链接起来；所谓的 main position，其实就是在不考虑
+      哈希冲突时，元素应该放置的位置；如果有哈希冲突导致元素的 MP 已经被占用了，那么它就要选择
+      其他 slot 存放；查询时也是首先获取其 MP，然后一直顺着链接找；所以为了优化速度，当插入一
+      个节点时发现其 MP 被占用了，那么为了效率，最好该 slot 是这两个元素中至少某一个的 MP，
+      从而加快整体的查找速度(否则两个元素都得顺着链表查) */
+
   mp = mainpositionTV(t, key);
   if (!isempty(gval(mp)) || isdummy(t)) {  /* main position is taken? */
     Node *othern;
@@ -687,6 +732,14 @@ void luaH_newkey (lua_State *L, Table *t, const TValue *key, TValue *value) {
       luaH_set(L, t, key, value);  /* insert key into grown table */
       return;
     }
+
+    /* NOTE: 新插入元素与已存在元素是否属于同一条冲突链(MP 相同)
+        (1) 如果该 slot 不是对方的 MP，说明该 slot 也是它解决为解决哈希冲突而被移动过来的，
+        所以我们将该元素移动到其他地方去，但是需要注意保持该元素在其哈希冲突链中；而新的元素则
+        不属于这条链(所以 gnext(new) = 0)
+        (2) 如果该 slot 也是对方的 MP，需要将新元素放在 freepos 处；而且由于它和 MP 处的
+        元素具有相同的 MP，所以需要链接到冲突链上(old->next  ==>  old->new->next) */
+
     lua_assert(!isdummy(t));
     othern = mainpositionfromnode(t, mp);
     if (othern != mp) {  /* is colliding node out of its main position? */
@@ -696,6 +749,8 @@ void luaH_newkey (lua_State *L, Table *t, const TValue *key, TValue *value) {
       gnext(othern) = cast_int(f - othern);  /* rechain to point to 'f' */
       *f = *mp;  /* copy colliding node into free pos. (mp->next also goes) */
       if (gnext(mp) != 0) {
+        /* NOTE: dist(f, next) = dist(mp, next) - dist(mp, f)
+                 dist(a, b) = idx(b) - idx(a) */
         gnext(f) += cast_int(mp - f);  /* correct 'next' */
         gnext(mp) = 0;  /* now 'mp' is free */
       }
@@ -726,6 +781,10 @@ void luaH_newkey (lua_State *L, Table *t, const TValue *key, TValue *value) {
 ** changing the real size of the array).
 */
 const TValue *luaH_getint (Table *t, lua_Integer key) {
+
+  /* NOTE: lua 代码中有许多中启发式的逻辑，这些逻辑通常是基于用户使用 lua 的习惯而形成的一些
+      fastpath；比如这里的 alimit，可以用来作为 array 部分的长度的一个 hint(提示)，*/
+
   if (l_castS2U(key) - 1u < t->alimit)  /* 'key' in [1, t->alimit]? */
     return &t->array[key - 1];
   else if (!limitequalsasize(t) &&  /* key still may be in the array part? */

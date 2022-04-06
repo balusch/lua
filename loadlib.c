@@ -674,6 +674,7 @@ static int ll_require (lua_State *L) {
     lua_setfield(L, 2, name);  /* LOADED[name] = returned value */
   else
     lua_pop(L, 1);  /* pop nil */
+    /* balus(q): 为啥不放在 else 里面？*/
   if (lua_getfield(L, 2, name) == LUA_TNIL) {   /* module set no value? */
     lua_pushboolean(L, 1);  /* use true as result */
     lua_copy(L, -1, -2);  /* replace loader result */
