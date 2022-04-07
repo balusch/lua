@@ -13,3 +13,14 @@ testes/libs/all
 
 temp
 lua
+
+# balus's config
+cmake-build-debug
+.idea/
+.vscode/
+.ccls-cache
+compile_commands.json
+demos/
+*.lua
+*.luac
+luac.out
