@@ -48,6 +48,7 @@ void luaT_init (lua_State *L) {
   int i;
   for (i=0; i<TM_N; i++) {
     G(L)->tmname[i] = luaS_new(L, luaT_eventname[i]);
+    /* NOTE: 这里的 fix 是"固定"的意思，而不是"修复" */
     luaC_fix(L, obj2gco(G(L)->tmname[i]));  /* never collect these names */
   }
 }
@@ -80,6 +81,7 @@ const TValue *luaT_gettmbyobj (lua_State *L, const TValue *o, TMS event) {
     default:
       mt = G(L)->mt[ttype(o)];
   }
+  /* QUESTION: 为啥这里不像 luaT_gettm() 一样缓存结果？ */
   return (mt ? luaH_getshortstr(mt, G(L)->tmname[event]) : &G(L)->nilvalue);
 }
 
@@ -134,6 +136,15 @@ void luaT_callTMres (lua_State *L, const TValue *f, const TValue *p1,
 }
 
 
+/*
+ * If any operand for an addition is not a number, Lua will try to call a meta
+ * method. It starts by checking the first operand (even if it is a number);
+ * if that operand does not define a metamethod for __add, then Lua will check
+ * the second operand. If Lua can find a metamethod, it calls the metamethod
+ * with the two operands as arguments, and the result of the call (adjusted to
+ * one value) is the result of the operation. Otherwise, if no metamethod is
+ * found, Lua raises an error.
+ */
 static int callbinTM (lua_State *L, const TValue *p1, const TValue *p2,
                       StkId res, TMS event) {
   const TValue *tm = luaT_gettmbyobj(L, p1, event);  /* try first operand */
@@ -152,8 +163,10 @@ void luaT_trybinTM (lua_State *L, const TValue *p1, const TValue *p2,
       case TM_BAND: case TM_BOR: case TM_BXOR:
       case TM_SHL: case TM_SHR: case TM_BNOT: {
         if (ttisnumber(p1) && ttisnumber(p2))
+          /* NOTE: case 中的操作符也可以在 float with integer value 上使用 */
           luaG_tointerror(L, p1, p2);
         else
+          /* NOTE: 这个错误表示操作数类型不适合 case 中的操作符，且没有对应的 metamethod */
           luaG_opinterror(L, p1, p2, "perform bitwise operation on");
       }
       /* calls never return, but to avoid warnings: *//* FALLTHROUGH */
