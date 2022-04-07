@@ -82,6 +82,9 @@ typedef enum {
 ** with 'slot' pointing to an empty 't[k]' (if 't' is a table) or NULL
 ** (otherwise). 'f' is the raw get function to use.
 */
+/* NOTE: 使用到了逗号表达式语法：最后一个元素被视为整个表达式的结果，
+    从 table 中 raw access 如果获取不到，不是返回 NULL，而是返回
+    一个预置的 abscentkey，它的类型枚举值为 32(是一个 variation) */
 #define luaV_fastget(L,t,k,slot,f) \
   (!ttistable(t)  \
    ? (slot = NULL, 0)  /* not a table; 'slot' is NULL and result is 0 */  \

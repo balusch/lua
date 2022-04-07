@@ -23,6 +23,7 @@ iAsBx              sBx (signed)(17)      |     A(8)      |   Op(7)     |
 iAx                           Ax(25)                     |   Op(7)     |
 isJ                           sJ(25)                     |   Op(7)     |
 
+  // TODO: 为啥要使用 excess K 的方式？
   A signed argument is represented in excess K: the represented value is
   the written unsigned value minus K, where K is half the maximum for the
   corresponding unsigned argument.
@@ -133,6 +134,7 @@ enum OpMode {iABC, iABx, iAsBx, iAx, isJ};  /* basic instruction formats */
 #define GETARG_sC(i)	sC2int(GETARG_C(i))
 #define SETARG_C(i,v)	setarg(i, v, POS_C, SIZE_C)
 
+// TODO: iABC 模式下的 k 值是啥？
 #define TESTARG_k(i)	check_exp(checkopm(i, iABC), (cast_int(((i) & (1u << POS_k)))))
 #define GETARG_k(i)	check_exp(checkopm(i, iABC), getarg(i, POS_k, 1))
 #define SETARG_k(i,v)	setarg(i, v, POS_k, 1)
@@ -185,7 +187,7 @@ enum OpMode {iABC, iABx, iAsBx, iAx, isJ};  /* basic instruction formats */
 /*
 ** R[x] - register
 ** K[x] - constant (in constant table)
-** RK(x) == if k(i) then K[x] else R[x]
+** RK(x) == if k(i) then K[x] else R[x] // TODO: k(i) 是怎么判断的？
 */
 
 
@@ -239,7 +241,7 @@ OP_BORK,/*	A B C	R[A] := R[B] | K[C]:integer			*/
 OP_BXORK,/*	A B C	R[A] := R[B] ~ K[C]:integer			*/
 
 OP_SHRI,/*	A B sC	R[A] := R[B] >> sC				*/
-OP_SHLI,/*	A B sC	R[A] := sC << R[B]				*/
+OP_SHLI,/*	A B sC	R[A] := sC << R[B]				*/ // QUESTION: 为啥不是 R[A] := R[B] << sC?
 
 OP_ADD,/*	A B C	R[A] := R[B] + R[C]				*/
 OP_SUB,/*	A B C	R[A] := R[B] - R[C]				*/

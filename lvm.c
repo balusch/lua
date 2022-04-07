@@ -297,7 +297,13 @@ void luaV_finishget (lua_State *L, const TValue *t, TValue *key, StkId val,
       /* else will try the metamethod */
     }
     else {  /* 't' is a table */
+
+      /* balus(N): isempty(slot) 只是判断该 TValue* 的 type 是否为 nil，
+       * 如果从 table 中没有找到元素，返回的是 absentkey，它的 tt_
+       * 是 nil 的一个 variant，所以 isempty() 为 true */
+
       lua_assert(isempty(slot));
+      /* balus(N): fasttm() 检查 mt->flags 来判断是否有对应的 metamethod */
       tm = fasttm(L, hvalue(t)->metatable, TM_INDEX);  /* table's metamethod */
       if (tm == NULL) {  /* no metamethod? */
         setnilvalue(s2v(val));  /* result is nil */
@@ -309,6 +315,8 @@ void luaV_finishget (lua_State *L, const TValue *t, TValue *key, StkId val,
       luaT_callTMres(L, tm, t, key, val);  /* call it */
       return;
     }
+    /* balus(N): 将 tm 赋值给 t，如果本轮从 tm 中找不到元素，
+     * 那么下一轮循环就从 tm 的 __index tm 继续找，直到超出阈值 */
     t = tm;  /* else try to access 'tm[key]' */
     if (luaV_fastget(L, t, key, slot, luaH_get)) {  /* fast track? */
       setobj2s(L, val, slot);  /* done */
@@ -1155,6 +1163,7 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
  startfunc:
   trap = L->hookmask;
  returning:  /* trap already set */
+  /* balus(Q): 为啥一定是 Lua closure？*/
   cl = clLvalue(s2v(ci->func));
   k = cl->p->k;
   pc = ci->u.l.savedpc;
@@ -1167,10 +1176,12 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
     }
     ci->u.l.trap = 1;  /* assume trap is on, for now */
   }
+  /* balus(N): [ci->func, L->top) 是当前函数使用了的空间 */
   base = ci->func + 1;
   /* main loop of interpreter */
   for (;;) {
     Instruction i;  /* instruction being executed */
+    /* blaus(N): vmfetch() 中会处理 debug hook */
     vmfetch();
     #if 0
       /* low-level line tracing for debugging Lua */
@@ -1179,25 +1190,48 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
     lua_assert(base == ci->func + 1);
     lua_assert(base <= L->top && L->top < L->stack_last);
     /* invalidate top for instructions not expecting it */
+    /* balus(N): IT ==> "in top" mode (uses top from previous instruction) */
     lua_assert(isIT(i) || (cast_void(L->top = base), 1));
+
+    /* REF: for opcodes, visit https://zhuanlan.zhihu.com/p/277452733 */
+
     vmdispatch (GET_OPCODE(i)) {
+
+      /* balus(N): (mode: iAB)
+       * Copies the value in register R(B) into register R(A).
+       * If R(B) holds a table, function or userdata, then the
+       * reference to that object is copied. */
+
       vmcase(OP_MOVE) {
         StkId ra = RA(i);
         setobjs2s(L, ra, RB(i));
         vmbreak;
       }
+
+      /* balus(N): (mode: iAsBx)
+       * Loads an integer operand into register R(A) */
+
       vmcase(OP_LOADI) {
         StkId ra = RA(i);
         lua_Integer b = GETARG_sBx(i);
         setivalue(s2v(ra), b);
         vmbreak;
       }
+
+      /* balus(N): (mode: iAsBx)
+       * Loads a floating point(which has an integer value) operand value into register R(A)
+       * REF: the difference between LOADF and LOADK http://lua-users.org/lists/lua-l/2020-04/msg00196.html */
+
       vmcase(OP_LOADF) {
         StkId ra = RA(i);
         int b = GETARG_sBx(i);
         setfltvalue(s2v(ra), cast_num(b));
         vmbreak;
       }
+
+      /* balus(N): (mode: iABx)
+       * Loads a constant value K(B) into register R(A) */
+
       vmcase(OP_LOADK) {
         StkId ra = RA(i);
         TValue *rb = k + GETARG_Bx(i);
@@ -1245,6 +1279,7 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         StkId ra = RA(i);
         UpVal *uv = cl->upvals[GETARG_B(i)];
         setobj(L, uv->v, s2v(ra));
+        /* REF: barrier: https://blog.codingnow.com/2011/03/lua_gc_aeoaeeeioe_5.html */
         luaC_barrier(L, uv, s2v(ra));
         vmbreak;
       }
@@ -1297,6 +1332,11 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         TValue *rb = vRB(i);
         TValue *rc = KC(i);
         TString *key = tsvalue(rc);  /* key must be a string */
+
+        /* balus(N): fastXXX() 和 finishXXX() 需要配合使用(准确来说是后者依赖前者)，
+         * finishXXX() 中利用到了 fastXXX() 中获取的一些信息，比如 rb 是
+         * 否为 table、slot 指向的位置(set 操作中，先 fastget()，然后直接set slot)... */
+
         if (luaV_fastget(L, rb, key, slot, luaH_getshortstr)) {
           setobj2s(L, ra, slot);
         }
@@ -1362,15 +1402,27 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
       }
       vmcase(OP_NEWTABLE) {
         StkId ra = RA(i);
+
+        /* balus(N): Lua 在 parse table constructor，比如：
+         * local t = { 1, 3, 7, hello = "world", world = "hello", this = "that" }
+         * 时，对于进入 hash 部分的元素，会计算其 log2 值作为 arg B 编码进指令 */
+
         int b = GETARG_B(i);  /* log2(hash size) + 1 */
         int c = GETARG_C(i);  /* array size */
         Table *t;
         if (b > 0)
           b = 1 << (b - 1);  /* size is 2^(b - 1) */
+
+        /* balus(N): Lua5.4 中 NEWTABLE 指令后面必须跟一条 EXTRAARG(iAx 模式)指令，
+         * 用于表示扩展 array 部分的长度值，如果 k == 0，那么 Ax 为0，否则 #array = R[C] + Ax*256，
+         * 为什么要 Ax*(MAXARG_C + 1) 是因为 NEWTABLE 本身(iABC) 模式 A/B/C 都只有 8bit，
+         * 所以最大可以表示的值为 255，那么如果要表示 256，那么可以将 R[C] 设置为 0，将 Ax 设置为 1 */
+
         lua_assert((!TESTARG_k(i)) == (GETARG_Ax(*pc) == 0));
         if (TESTARG_k(i))  /* non-zero extra argument? */
           c += GETARG_Ax(*pc) * (MAXARG_C + 1);  /* add it to size */
         pc++;  /* skip extra argument */
+        /* TODO: 下面这句的作用没有理解 */
         L->top = ra + 1;  /* correct top in case of emergency GC */
         t = luaH_new(L);  /* memory allocation */
         sethvalue2s(L, ra, t);
@@ -1381,6 +1433,15 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
       }
       vmcase(OP_SELF) {
         StkId ra = RA(i);
+
+        /* balus(N): SELF 指令用于 OOP 中的冒号运算符(:)，比如 `local s = "hello"; s:sub(1, 3)`，
+         * SELF 指令的作用是，从 object 中获取到对应的方法(比如上面的 sub)，并将该 object 作为
+         * method 的第一个参数；具体到指令层面，iABC 模式中，method 会被放入 R[A]，object 会
+         * 被放入 R[A+1]，使用 RK[B] 来从 object 中索引 method
+         * 需要注意，SELF 指令**只**用于冒号运算符中，使用 .+obj 则不会产生 SELF 指令，比如
+         * `local s = "hello", s.sub(s, 1, 3)`，则只是简单从 s 中获取到 key 为 "sub" 的
+         * value(通过 __index 元方法)，然后调用该方法，其中就没有 SELF 指令的参与 */
+
         const TValue *slot;
         TValue *rb = vRB(i);
         TValue *rc = RKC(i);
@@ -1394,10 +1455,26 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         vmbreak;
       }
       vmcase(OP_ADDI) {
+
+        /* balus(N): 其中的 'I' 是 immediate 的缩写，这个指令用于立即数场景中。这是一个
+         * iABsC(R[A] = R[B] + sC) 模式的指令，其中 sC 就是一个编码在指令中的立即数，
+         * 比如：`local a = 3; local b = a + 7` 第二条语句就会产生一个 ADDI 指令，
+         * 其中 7 就是一个立即数，需要注意的是另外一个操作数是寄存器而不能是立即数，否则
+         * 的话，parse 的时候就知道相加的结果了，codegen 的时候直接使用 LOAD 类型的
+         * 指令将两个立即数的结果 LOAD 到 R[A] 中就可以了，比如 `local b = 3 + 7`
+         * 就会被编译为一条 LOADI 指令 */
+
         op_arithI(L, l_addi, luai_numadd);
         vmbreak;
       }
       vmcase(OP_ADDK) {
+
+        /* balus(N): 这里的 K 表示 constant，这是一条 iABC(R[A] = R[B] + K[C]) 模式
+         * 的指令，操作数 C 表示常量在常量池中的编号，比如`loacal a = 3, local b = a + 65535`
+         * 其中 65535 超出了 sC 所能表示的范围(-2^7-2^7)，所以存放在常量池中，因此
+         * 第二条语句会被编译为一条 ADDK 指令；此外，和 ADDI 一样，操作数 B 也是一个
+         * 寄存器编号，而不能是常量编号或者立即数 */
+
         op_arithK(L, l_addi, luai_numadd);
         vmbreak;
       }
@@ -1457,6 +1534,7 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         }
         vmbreak;
       }
+      /* balus(N): difference between op_add and op_addi/op_addk */
       vmcase(OP_ADD) {
         op_arith(L, l_addi, luai_numadd);
         vmbreak;
@@ -1506,8 +1584,15 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         vmbreak;
       }
       vmcase(OP_MMBIN) {
-        StkId ra = RA(i);
-        Instruction pi = *(pc - 2);  /* original arith. expression */
+
+      /* blaus(N): add OP_MMXXX instruction to support explict metamethod call,
+       * in Lua 5.3, the metamethod call are implicitly handled in original
+       * call(eg, __add metamethod call is processed in add instruction)
+       * REF: https://zhuanlan.zhihu.com/p/277452733
+       * SYNTAX: {A  B C}    call metamethod C over R[A] and R[B] */
+
+      StkId ra = RA(i);
+      Instruction pi = *(pc - 2);  /* original arith. expression */
         TValue *rb = vRB(i);
         TMS tm = (TMS)GETARG_C(i);
         StkId result = RA(pi);
@@ -1516,16 +1601,22 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         vmbreak;
       }
       vmcase(OP_MMBINI) {
+
+        /* balus(N): {A sB C k}  call metamethod C over R[A] and sB  */
+
         StkId ra = RA(i);
         Instruction pi = *(pc - 2);  /* original arith. expression */
         int imm = GETARG_sB(i);
         TMS tm = (TMS)GETARG_C(i);
-        int flip = GETARG_k(i);
+        int flip = GETARG_k(i); /* TODO: what does flip mean? */
         StkId result = RA(pi);
         Protect(luaT_trybiniTM(L, s2v(ra), imm, flip, result, tm));
         vmbreak;
       }
       vmcase(OP_MMBINK) {
+
+        /* balus(N): {A  B C k}  call metamethod C over R[A] and K[B] */
+
         StkId ra = RA(i);
         Instruction pi = *(pc - 2);  /* original arith. expression */
         TValue *imm = KB(i);
@@ -1535,6 +1626,9 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         Protect(luaT_trybinassocTM(L, s2v(ra), imm, flip, result, tm));
         vmbreak;
       }
+
+      /* balus(N): how unary operators use binary metamethod helper? */
+
       vmcase(OP_UNM) {
         StkId ra = RA(i);
         TValue *rb = vRB(i);
@@ -1675,16 +1769,19 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         int nresults = GETARG_C(i) - 1;
         if (b != 0)  /* fixed number of arguments? */
           L->top = ra + b;  /* top signals number of arguments */
+        /* TODO: top 由哪条指令来设置？设置和使用要分开？如何分辨这两类用法? */
         /* else previous instruction set top */
         savepc(L);  /* in case of errors */
         if ((newci = luaD_precall(L, ra, nresults)) == NULL)
           updatetrap(ci);  /* C call; nothing else to be done */
+        /* TODO: c frame 和 lua frame 的层次如何对应？ */
         else {  /* Lua call: run function in this same C frame */
           ci = newci;
           goto startfunc;
         }
         vmbreak;
       }
+      /* TODO: 理解为什么 Lua 中的 TAILCALL 可以避免递归爆栈 */
       vmcase(OP_TAILCALL) {
         StkId ra = RA(i);
         int b = GETARG_B(i);  /* number of arguments + 1 (function) */
@@ -1805,11 +1902,28 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
           pc += GETARG_Bx(i) + 1;  /* skip the loop */
         vmbreak;
       }
+
+      /* balus(N): 泛型 for 的使用要点：
+       * - for var-list in expr-list do body end
+       * - expr-list 需要返回三个值：迭代函数、不可变状态、控制变量的初始值
+       * - 比如 for k, v in pairs(t)，其中 pairs(t) 就会返回：next、t、初始的 key
+       *
+       * balus(N): TFORPREP 栈中元素：
+       * - R[A]:   generator, 即迭代函数(下面注释中称之为 iterator)
+       * - R[A+1]: state, 即不可变状态
+       * - R[A+2]: control variable, 即控制变量
+       * - R[A+3]: tbc value, 这个是 TBC 机制出来后新保存的一个值，目前还不太了解这个值的用途
+       *
+       * REF: https://mk.woa.com/note/3672
+       *      https://www.lua.org/manual/5.4/manual.html#3.3.5(for 循环中的 TBC)
+       */
       vmcase(OP_TFORPREP) {
        StkId ra = RA(i);
         /* create to-be-closed upvalue (if needed) */
         halfProtect(luaF_newtbcupval(L, ra + 3));
         pc += GETARG_Bx(i);
+        /* balus(N): pc += bx 为 TFORCALL 指令，而 pc 的语义为
+         * 【指向当前执行指令的下一条指令】，所以需要 +1 */
         i = *(pc++);  /* go to next instruction */
         lua_assert(GET_OPCODE(i) == OP_TFORCALL && ra == RA(i));
         goto l_tforcall;
@@ -1835,12 +1949,21 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
        l_tforloop: {
         StkId ra = RA(i);
         if (!ttisnil(s2v(ra + 4))) {  /* continue loop? */
+          /* balus(N): 将 ra + 4 设置到 ra + 2 去 */
           setobjs2s(L, ra + 2, ra + 4);  /* save control variable */
           pc -= GETARG_Bx(i);  /* jump back */
         }
         vmbreak;
       }}
+
       vmcase(OP_SETLIST) {
+
+      /* balus(N): SETLIST 指令用在 table constructor 中初始化连续位置上的值
+       * 比如，local t = { 1, 2, 3, 4, 5 }，会被编译为 SETLIST 0 5 0
+       * (预先将 1,2,3,4,5 LOADI 到栈索引为 1 开始的位置)，这里 A = 0，
+       * 因为 table t 在栈索引为 0 的位置，B = 5 表示连续 5 个元素，C = 0
+       * 表示要从 C+1 = 1 开始为数组索引赋值 */
+
         StkId ra = RA(i);
         int n = GETARG_B(i);
         unsigned int last = GETARG_C(i);
@@ -1850,6 +1973,7 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         else
           L->top = ci->top;  /* correct top in case of emergency GC */
         last += n;
+        /* balus(N): 这里是 SETLIST 后面的 EXTRAARG 的作用 */
         if (TESTARG_k(i)) {
           last += GETARG_Ax(*pc) * (MAXARG_C + 1);
           pc++;
@@ -1864,6 +1988,8 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         }
         vmbreak;
       }
+
+      /* balus(N): 理解 Lua 中 closure 和 prototype 这俩概念的异同？*/
       vmcase(OP_CLOSURE) {
         StkId ra = RA(i);
         Proto *p = cl->p->p[GETARG_Bx(i)];
@@ -1871,6 +1997,7 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         checkGC(L, ra + 1);
         vmbreak;
       }
+      /* balus(N): local a, b, c, = ...  */
       vmcase(OP_VARARG) {
         StkId ra = RA(i);
         int n = GETARG_C(i) - 1;  /* required results */
@@ -1886,6 +2013,34 @@ void luaV_execute (lua_State *L, CallInfo *ci) {
         updatebase(ci);  /* function has new base after adjustment */
         vmbreak;
       }
+
+      /* balus(N): 这条指令本身没有意义，主要是配合其他指令一同使用；比如说创建一个有 10000 元素
+       * 的 table：local t = { 1, ...., 10000 }，这样的指令大概是这样的：
+       *          1       [1]     VARARGPREP      0
+       *          2       [1]     NEWTABLE        0 0 16  ; 10000
+       *          3       [1]     EXTRAARG        39
+       *          4       [2]     LOADI           1 1
+       *          5       [3]     LOADI           2 2
+       *          ...
+       *          53      [51]    LOADI           50 50
+       *          54      [52]    SETLIST         0 50 0
+       *          ...
+       *          105     [101]   LOADI           50 100
+       *          106     [102]   SETLIST         0 50 50
+       *          ...
+       *          360     [351]   SETLIST         0 50 44 ; 300
+                  361     [351]   EXTRAARG        1
+       *          ...
+       *          10395   [10002] LOADI           50 10000
+       *          10396   [10002] SETLIST         0 50 222        ; 9950
+       *          10397   [10002] EXTRAARG        38
+       * 这里有两类地方用到了 EXTRAARG，且其 Ax 操作数都不为 0，一个是 NEWTABLE 指令，
+       * 另外一个是 SETLIST 指令；其中 NEWTABLE 后面的 EXTRAARG 用于扩展数组部分的长度，
+       * 此时 #array = R[C](NEWTABLE) + Ax(EXTRAARG)*256，这里就是 16 + 39 * 256 = 10000；
+       * 而 SETLIST 后面的 EXTRAARG 则是用来扩展数组索引，比如上面最后一条 SETLIST，
+       * 开始赋值的数组索引实际上是 R[C](SETLIST) + Ax(EXTRAARG)*256 = 222 + 256 * 38 = 9950
+       * 也就是说从 9950 开始，给 50 个数组索引初始化，正好是 10000
+       */
       vmcase(OP_EXTRAARG) {
         lua_assert(0);
         vmbreak;
