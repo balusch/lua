@@ -243,7 +243,7 @@ static int equalkey (const TValue *k1, const Node *n2, int deadok) {
       return pvalue(k1) == pvalueraw(keyval(n2));
     case LUA_VLCF:
       return fvalue(k1) == fvalueraw(keyval(n2));
-      /* QUESTION: 为啥这里要使用 ctb？long string 难道不是默认就是 collectable 的么？ */
+      /* balus(Q): 为啥这里要使用 ctb？long string 难道不是默认就是 collectable 的么？ */
     case ctb(LUA_VLNGSTR):
       return luaS_eqlngstr(tsvalue(k1), keystrval(n2));
     default:
@@ -271,7 +271,7 @@ LUAI_FUNC unsigned int luaH_realasize (const Table *t) {
     return t->alimit;  /* this is the size */
   else {
 
-    /* NOTE: 计算最小的 >= t->alimit 的 2 的幂，这里 t->alimit 不能为 2 的幂(在上面的 if 中就被处理了)
+    /* blaus(N): 计算最小的 >= t->alimit 的 2 的幂，这里 t->alimit 不能为 2 的幂(在上面的 if 中就被处理了)
      * 对于 t->alimit=32，下面逻辑计算出来的值为 64，而不是 32，算法逻辑可以参考以下链接：
      * - https://stackoverflow.com/questions/466204/rounding-up-to-next-power-of-2
      * - https://jameshfisher.com/2018/03/30/round-up-power-2 */
@@ -470,11 +470,12 @@ static unsigned int numusearray (const Table *t, unsigned int *nums) {
     }
     /* count elements in range (2^(lg - 1), 2^lg] */
     for (; i <= lim; i++) {
-      /* NOTE: 这里用的是 i-1，是因为 Lua table 索引从 1 开始，t[0] = 1234 会被放在 hash part */
+      /* balus(N): 这里用的是 i-1，是因为 Lua table 索引从 1 开始，t[0] = 1234 会被放在 hash part */
       if (!isempty(&t->array[i-1]))
         lc++;
     }
-    nums[lg] += lc; /* QUESTION: 为啥不是直接 =，而要 += ? */
+    /* balus(Q): 为啥不是直接 =，而要 += ? */
+    nums[lg] += lc;
     ause += lc;
   }
   return ause;
@@ -507,7 +508,7 @@ static int numusehash (const Table *t, unsigned int *nums, unsigned int *pna) {
 */
 static void setnodevector (lua_State *L, Table *t, unsigned int size) {
   if (size == 0) {  /* no elements to hash part? */
-    /* QUESTION: dummynode 的作用是什么？直接用 NULL 不行么？ */
+    /* balus(Q): dummynode 的作用是什么？直接用 NULL 不行么？ */
     t->node = cast(Node *, dummynode);  /* use common 'dummynode' */
     t->lsizenode = 0;
     t->lastfree = NULL;  /* signal that it is using dummy node */
@@ -587,18 +588,18 @@ void luaH_resize (lua_State *L, Table *t, unsigned int newasize,
   TValue *newarray;
   /* create new hash part with appropriate size into 'newt' */
   setnodevector(L, &newt, nhsize);
-  /* NOTE: 如果 array 部分是收缩的话，需要将被收缩的 array 部分移动到新 table 的 hash 中去 */
+  /* balus(N): 如果 array 部分是收缩的话，需要将被收缩的 array 部分移动到新 table 的 hash 中去 */
   if (newasize < oldasize) {  /* will array shrink? */
-    /* QUESTION: 这个 t->alimit 具体影响了哪里的逻辑? */
+    /* balus(Q): 这个 t->alimit 具体影响了哪里的逻辑? */
     t->alimit = newasize;  /* pretend array has new size... */
     exchangehashpart(t, &newt);  /* and new hash */
     /* re-insert into the new hash the elements from vanishing slice */
     for (i = newasize; i < oldasize; i++) {
       if (!isempty(&t->array[i]))
-        /* QUESTION: 会不会存在 key 相同的情况? */
+        /* balus(Q): 会不会存在 key 相同的情况? */
         luaH_setint(L, t, i + 1, &t->array[i]);
     }
-    /* NOTE: 此时 newt 中包含 old array 中将被删除的部分，暂时还没有将 old hash 中的元素移过来 */
+    /* balus(N): 此时 newt 中包含 old array 中将被删除的部分，暂时还没有将 old hash 中的元素移过来 */
     t->alimit = oldasize;  /* restore current size... */
     exchangehashpart(t, &newt);  /* and hash (in case of errors) */
   }
@@ -646,7 +647,7 @@ static void rehash (lua_State *L, Table *t, const TValue *ek) {
   na = numusearray(t, nums);  /* count keys in array part */
   totaluse = na;  /* all those keys are integer keys */
   totaluse += numusehash(t, nums, &na);  /* count keys in hash part */
-  /* TODO: 下面的 extra key 逻辑没有看懂 */
+  /* balus(Q): ek 是本次要插入 table 的 key，也要和其他 integer 一起统计 */
   /* count extra key */
   if (ttisinteger(ek))
     na += countint(ivalue(ek), nums);
@@ -685,7 +686,7 @@ void luaH_free (lua_State *L, Table *t) {
 
 static Node *getfreepos (Table *t) {
   if (!isdummy(t)) {
-    /* NOTE: 如果存在 free slot，那么只能在 t->lastfree 前面 */
+    /* balus(N): 如果存在 free slot，那么只能在 t->lastfree 前面 */
     while (t->lastfree > t->node) {
       t->lastfree--;
       if (keyisnil(t->lastfree))
@@ -716,7 +717,7 @@ void luaH_newkey (lua_State *L, Table *t, const TValue *key, TValue *value) {
       setivalue(&aux, k);
       key = &aux;  /* insert it as an integer */
     }
-    /* NOTE: 如何判断是否为 NaN: NaN != NaN */
+    /* balus(Q): 如何判断是否为 NaN: NaN != NaN */
     else if (l_unlikely(luai_numisnan(f)))
       luaG_runerror(L, "table index is NaN");
   }
@@ -729,38 +730,45 @@ void luaH_newkey (lua_State *L, Table *t, const TValue *key, TValue *value) {
     if (f == NULL) {  /* cannot find a free place? */
       rehash(L, t, key);  /* grow table */
       /* whatever called 'newkey' takes care of TM cache */
-      /* QUESTION: 为什么这里不需要重新解决哈希冲突? */
+      /* balus(Q): 为什么这里不需要重新解决哈希冲突? */
       luaH_set(L, t, key, value);  /* insert key into grown table */
       return;
     }
-    lua_assert(!isdummy(t)); /* NOTE: 存在 freepos，肯定不是 dummy */
+    /* balus(N): 存在 freepos，肯定不是 dummy */
+    lua_assert(!isdummy(t));
     othern = mainpositionfromnode(t, mp);
     if (othern != mp) {  /* is colliding node out of its main position? */
-      /* NOTE: f 的插入位置(指针实际是 distance)
-               插入前: prev1 -> mp(old) -> next1 -> next2
-               插入后: prev1 -> f(old) -> next1 -> next2(感觉有问题，mp 都给丢了)
-               f 在位置上不同于之前的 mp，但是内容是将 mp 的复制过去了 */
+
+      /* balus(N): f 的插入位置(指针实际是 distance)
+       * 插入前: prev1 -> mp(old) -> next1 -> next2
+       * 插入后: prev1 -> f(old) -> next1 -> next2(感觉有问题，mp 都给丢了)
+       * f 在位置上不同于之前的 mp，但是内容是将 mp 的复制过去了 */
+
       /* yes; move colliding node into free position */
-      /* QUESTION: 怎么保证 othern 一定在 mp 的前面呢? */
+      /* balus(Q): 怎么保证 othern 一定在 mp 的前面呢? */
       while (othern + gnext(othern) != mp)  /* find previous */
         othern += gnext(othern);
       gnext(othern) = cast_int(f - othern);  /* rechain to point to 'f' */
       *f = *mp;  /* copy colliding node into free pos. (mp->next also goes) */
       if (gnext(mp) != 0) {
-        /* NOTE: 这里为什么用 +=，因为前面 *f = *mp 把 mp 到 mp->next1 的距离给复制过来了，
-            如果 mp 到 mp->next1 的距离(即 gnext(mp)) 不为 0，说明 mp 后面的确有元素，所以
-            f 到 mp->next1 的距离实际上是 f 到 mp 的距离加上 mp 到 mp->next 的距离*/
+
+        /* balus(N): 这里为什么用 +=，因为前面 *f = *mp 把 mp 到 mp->next1 的距离给复制过来了，
+         * 如果 mp 到 mp->next1 的距离(即 gnext(mp)) 不为 0，说明 mp 后面的确有元素，所以
+         * f 到 mp->next1 的距离实际上是 f 到 mp 的距离加上 mp 到 mp->next 的距离*/
+
         gnext(f) += cast_int(mp - f);  /* correct 'next' */
-        /* QUESTION: 为啥下面的 mp 就不用 set 为 0 呢？ */
+        /* balus(Q): 为啥下面 else 的 mp 就不用 set 为 0 呢？ */
         gnext(mp) = 0;  /* now 'mp' is free */
       }
-      /* QUESTION: 为什么下面的 else 不用 setempty? */
+      /* balus(Q): 为什么下面的 else 不用 setempty? */
       setempty(gval(mp));
     }
     else {  /* colliding node is in its own main position */
-      /* NOTE: f 的插入位置(指针实际是节点间的 distance)
-               插入前: prev1 -> mp(old) -> next1 -> next2
-               插入后: prev1 -> mp(old) -> f(new) -> next1 -> next2 */
+
+      /* balus(N): f 的插入位置(指针实际是节点间的 distance)
+       * 插入前: prev1 -> mp(old) -> next1 -> next2
+       * 插入后: prev1 -> mp(old) -> f(new) -> next1 -> next2 */
+
       /* new node will go into free position */
       if (gnext(mp) != 0)
         gnext(f) = cast_int((mp + gnext(mp)) - f);  /* chain new position */
@@ -794,6 +802,12 @@ const TValue *luaH_getint (Table *t, lua_Integer key) {
    * - 判断 array part 的边界需要考虑 alimit 和 capacity 的关系
    * - capacity 并没有显示记录，所以需要实时计算(通过 alimit)
    * - 尽可能地避免计算 capacity，所以会更加一些常见的 Lua 操作检查 fast path
+   *
+   * balus(N): luaH_getint 在 array part 查找和在 hash part 查找的含义是不同的：
+   * - array part：
+   * - hash part：找到一个已经在使用着的、key 类型以及值相同的 integer key slot
+   *
+   * Lua table 的 hash part 采用了 chained scatter hash with Brent's variation
    */
 
   if (l_castS2U(key) - 1u < t->alimit)  /* 'key' in [1, t->alimit]? */
